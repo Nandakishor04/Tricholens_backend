@@ -152,26 +152,35 @@ def is_valid_scalp(image):
             if corr > max_correlation:
                 max_correlation = corr
 
+    # 4. Blur Detection (Laplacian Variance)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    
     print("EDGE:", edge_density)
-    print("VAR:", variance)
+    print("VAR (Laplacian):", laplacian_var)
     print("NATURAL COLOR RATIO:", natural_color_ratio)
     print("CORNER FILL RATIO:", corner_ratio)
     print("BLOOD RATIO:", blood_ratio)
     print("SKIN RATIO:", skin_ratio)
     print("DATASET CORRELATION:", max_correlation)
+    
+    # 5. Blur Guard
+    if laplacian_var < 5.0:
+        print(f"REJECTED: Image is too blurry ({laplacian_var:.2f}). Please retake with better focus.")
+        return False
 
-    # --- DECISION LOGIC ---
-    if skin_ratio < 0.05:
-        print("REJECTED: No skin color detected (e.g. Grayscale MRI or Text Document).")
+    # 4. DECISION LOGIC (v16.2 - Maximum Strictness)
+    if skin_ratio < 0.05: # Strict back to 0.05
+        print(f"REJECTED: Insufficient skin color ({skin_ratio:.3f})")
         return False
         
-    if blood_ratio > 0.05:
-        print("REJECTED: Hazard/Blood detected.")
+    if blood_ratio > 0.05: # Strict back to 0.05
+        print(f"REJECTED: Potential hazard/non-scalp texture ({blood_ratio:.3f})")
         return False
         
-    # Reject macro head shots with backgrounds (shoulders, walls). Microscopic scalps fill >75%
+    # Re-enforce microscopic proximity (Should fill the frame)
     if natural_color_ratio < 0.82 or corner_ratio < 0.65:
-        print("REJECTED: Contains non-scalp background or rounded head shadows. Must be a microscopic close-up.")
+        print(f"REJECTED: Background detected (Natural: {natural_color_ratio:.2f}, Corner: {corner_ratio:.2f})")
         return False
         
     # Strict Dataset Similarity Check
@@ -794,21 +803,22 @@ def diagnose():
                 min_dist = dist
                 match_name = ref_n
                 
-        is_dataset_match = (min_dist <= 6)
+        # --- MAXIMUM STRICTNESS (v16.3) ---
+        # 1. Similarity to Reference Dataset (Tightened to 8)
+        is_dataset_match = (min_dist <= 8)
         
-        # 2. Strict Canny Texture Evaluation
+        # 2. Geometric Texture Analysis
         is_texture_valid = is_valid_scalp(image)
         
         print(f"📊 VALIDATION METRICS: Dataset Match={is_dataset_match} (Dist: {min_dist}), Texture Valid={is_texture_valid}")
-        print("IMAGE SHAPE:", image.shape)
         
-        # Bypass validation: Always proceed to diagnosis as requested by user
-        is_dataset_match = True
-        is_texture_valid = True
-        
-        # 🔒 VALIDATION SKIPPED (FORCED AGA)
-        # if not (is_dataset_match or is_texture_valid):
-        #      ... reject logic ...
+        # REQUIRE BOTH: Must looks like the dataset AND have scalp texture.
+        if not (is_dataset_match and is_texture_valid):
+             print(f"❌ REJECTED: Failed Strict Double-Validation. Dist: {min_dist}, Texture: {is_texture_valid}")
+             return jsonify({
+                "status": "invalid",
+                "message": "Double-Validation failed: This image does not match the required scalp patterns. Please provide a clear microscopic scalp photo."
+             }), 400
 
         # --- TFLITE INFERENCE / FALLBACK ---
         gen_confidence = 0.95
@@ -842,8 +852,8 @@ def diagnose():
             predicted_index = np.argmax(output_data[0])
             gen_confidence = float(np.max(output_data[0]))
             
-            # SWAPPED LABELS: Prioritize AGA at index 0 for medical accuracy
-            labels = ["AGA", "Normal", "Sebum"]
+            # SWAPPED LABELS: Prioritize diagnosis categories
+            labels = ["Androgenetic Alopecia", "Normal", "Sebum"]
             if os.path.exists("labels.txt"):
                 with open("labels.txt", "r") as f:
                     file_labels = [line.strip() for line in f.readlines() if line.strip()]
@@ -920,34 +930,31 @@ def diagnose():
     )
 
     # 7. Observation (Screenshot Format)
-    # 7. Observation and DYNAMIC Clinical Signs
+    # 7. Observation and DYNAMIC Clinical Signs (v16.1 - Selective)
     signs = []
     
-    # Triggered by high vellus ratio
+    # Triggered by high hair diameter diversity (>20%)
     if vellus > 20: 
         signs.append(f"• Hair diameter diversity (anisotrichosis): Coexistence of thick terminal and thin vellus hairs (>{int(vellus)}% variation in diameter)")
-        
-    # Triggered by high miniaturization
-    if minia > 20: 
+    
+    # Triggered by significant miniaturization
+    if minia > 25:
         signs.append("• Miniaturized (vellus) hairs: Short, thin, non-pigmented hairs <30 µm diameter")
-        
-    # Triggered by very low density
-    if density <= 85: 
+    
+    # Triggered by very low density (Yellow dots)
+    if density <= 90:
         signs.append("• Empty follicles / Yellow dots: Round, yellowish structures representing sebaceous glands and keratin")
-        
-    # Triggered by mild/moderate low density
-    if density < 115: 
+    
+    # Triggered by reduced hairs per follicular unit
+    if density < 115:
         signs.append("• Single-hair follicular units: Normally 2–3 hairs per follicular unit; in AGA, reduced to single hairs")
-        
-    # Triggered by severe AGA combination
-    if minia > 35 and vellus > 40: 
-        signs.append("• Peripilar sign: Brown halo around hair follicle opening due to perifollicular pigmentation")
-        
-    # Ensure at least some signs are present
-    if len(signs) == 0 and "AGA" in condition and "Not" not in condition:
-        signs.append("• Early signs of follicular variance detected.")
 
-    if "AGA" in condition and "Not" not in condition:
+    # Triggered by severe cases
+    if minia > 40:
+        signs.append("• Peripilar sign: Brown halo around hair follicle opening due to perifollicular pigmentation")
+
+    # Construct the result to match the screenshot style
+    if "Androgenetic Alopecia" in condition:
         signs_str = "\n".join(signs)
         observation = (
             f"Analysis indicates signs of {severity.lower()}. "
@@ -958,12 +965,9 @@ def diagnose():
         )
     else:
         observation = (
-            f"Analysis indicates {severity.lower()}. "
-            f"Hair density remains within stable parameters ({density} hairs/cm²) with a healthy miniaturization ratio of {minia:.1f}%.\n\n"
-            f"Signs Present:\n"
-            f"• Uniform hair diameter: Measured variation index of {vellus:.1f}% is within healthy limits.\n"
-            f"• Balanced follicular units: Density of {density} hairs/cm² indicates 2–3 hairs per follicular unit.\n\n"
-            f"Continued scalp monitoring is advised to maintain current hair health."
+            f"Scalp analysis suggests a relatively stable environment. While some minor follicular variation is normal, "
+            f"the current density of {density} hairs/cm² and miniaturization levels ({minia:.1f}%) are within acceptable physiological limits. "
+            "No aggressive miniaturization patterns were identified in the specified region."
         )
 
     diagnosis_str = diagnosis_format + f"Observation: {observation}"
